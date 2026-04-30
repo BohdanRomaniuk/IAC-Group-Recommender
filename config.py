@@ -1,138 +1,218 @@
+"""Training configuration for the IAC group recommender.
+
+Defines :class:`TrainingConfig`, a dataclass that centralises every
+hyper-parameter, file-system path and runtime device used across the project.
+A YAML loader is provided for reproducible experiments.
+
+Backward-compatibility aliases (legacy names such as ``Config``,
+``saves_folder_path``, ``num_episodes``…) are exposed at the bottom of
+this module so existing imports keep working without modification.
 """
-Configurations
-"""
-import os
-from typing import Optional
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass, field, fields
+from pathlib import Path
+from typing import Any, ClassVar, Dict, List, Optional, Tuple
 
 import torch
 
-try:
+try:  # PyYAML is optional
     import yaml  # type: ignore
-except ImportError:  # PyYAML is optional; from_yaml will raise if missing
+except ImportError:  # pragma: no cover
     yaml = None  # type: ignore
 
 
-class Config(object):
+__all__ = ["TrainingConfig"]
+
+logger = logging.getLogger(__name__)
+
+
+_PROJECT_ROOT = Path(__file__).resolve().parent
+_DEFAULT_DATASET_DIR = _PROJECT_ROOT / "data" / "MovieLens-Rand"
+_DEFAULT_CHECKPOINT_DIR = Path("data") / "saves"
+_DEFAULT_OUTPUT_DIR = Path("data") / "results"
+
+_TUPLE_FIELDS = frozenset({"actor_hidden_sizes", "critic_hidden_sizes"})
+
+
+def _resolve_device() -> torch.device:
+    """Return the best torch device available at runtime."""
+    if torch.cuda.is_available():
+        logger.info("Using GPU (CUDA acceleration enabled)")
+        return torch.device("cuda:0")
+    logger.info("Using CPU")
+    return torch.device("cpu")
+
+
+@dataclass
+class TrainingConfig:
+    """Project-wide configuration container.
+
+    All hyper-parameters live here so that scripts can be driven by a
+    single typed object. Derived fields (``state_size``,
+    ``state_embedding_dim``, ``action_embedding_dim``) are computed in
+    :meth:`__post_init__`.
     """
-    Configurations
-    """
 
-    def __init__(self):
-        # Data
-        self.data_folder_path = os.path.join('./', 'data', 'MovieLens-Rand')  # Path to the dataset folder
-        self.item_path = os.path.join(self.data_folder_path, 'movies.dat')    # Path to the movies file
-        self.user_path = os.path.join(self.data_folder_path, 'users.dat')     # Path to the users file
-        self.group_path = os.path.join(self.data_folder_path, 'groupMember.dat')  # Path to the group-members mapping file
-        self.saves_folder_path = os.path.join('data', 'saves')                # Folder where trained model checkpoints are saved
-        self.results_folder_path = os.path.join('data', 'results')            # Folder for loss-curve plots and metric logs
+    # --- Paths ----------------------------------------------------------- #
+    dataset_dir: str = str(_DEFAULT_DATASET_DIR)
+    checkpoint_dir: str = str(_DEFAULT_CHECKPOINT_DIR)
+    output_dir: str = str(_DEFAULT_OUTPUT_DIR)
 
-        # Recommendation system
-        self.history_length = 10                     # Number of recently watched items included in the state (sliding window)
-        self.top_K_list = [5, 10, 15, 20]   # Values of K used for Precision@K and Recall@K evaluation metrics
-        self.rewards = [0, 1]                        # Possible reward values: 0 = item not liked, 1 = item liked
+    # --- Recommendation system ------------------------------------------ #
+    history_length: int = 10
+    eval_top_k_values: List[int] = field(default_factory=lambda: [5, 10, 15, 20])
+    rewards: List[int] = field(default_factory=lambda: [0, 1])
 
-        # Reinforcement learning
-        self.embedding_size = 64                                               # Dimensionality of user and item embedding vectors
-        self.state_size = self.history_length + 1                              # State size: history_length items + 1 aggregated group vector
-        self.action_size = 1                                                   # Number of items recommended per step
-        self.embedded_state_size = self.state_size * self.embedding_size       # Total state vector size fed into Actor/Critic (11 * 64 = 704)
-        self.embedded_action_size = self.action_size * self.embedding_size     # Total action vector size (1 * 64 = 64)
+    # --- Reinforcement learning ----------------------------------------- #
+    embedding_size: int = 64
+    action_size: int = 1
 
-        # Numbers
-        self.item_num = None         # Total number of unique items (movies); filled at runtime from dataset
-        self.user_num = None         # Total number of unique users; filled at runtime from dataset
-        self.group_num = None        # Number of groups used for training; filled at runtime from dataset
-        self.total_group_num = None  # Total number of groups (train + eval); filled at runtime from dataset
+    # --- Dataset cardinalities (filled at runtime) ---------------------- #
+    item_num: Optional[int] = None
+    user_num: Optional[int] = None
+    group_num: Optional[int] = None
+    total_group_num: Optional[int] = None
 
-        # Environment
-        self.env_n_components = self.embedding_size  # Number of latent components in NMF (matches embedding_size)
-        self.env_tol = 1e-4                          # Convergence tolerance for NMF: stops if update < 0.0001
-        self.env_max_iter = 1000                     # Maximum number of NMF iterations to prevent infinite loops
-        self.env_alpha = 0.001                       # Regularization coefficient for NMF to prevent overfitting
+    # --- Environment (NMF) --------------------------------------------- #
+    env_tol: float = 1e-4
+    env_max_iter: int = 1000
+    env_alpha: float = 1e-3
 
-        # Actor-Critic network
-        self.actor_hidden_sizes = (256, 128)  # Hidden layer sizes of Actor MLP:  704 → 256 → 128 → 64
-        self.critic_hidden_sizes = (256, 128) # Hidden layer sizes of Critic MLP: 768 → 256 → 128 → 1
+    # --- Networks ------------------------------------------------------- #
+    actor_hidden_sizes: Tuple[int, ...] = (256, 128)
+    critic_hidden_sizes: Tuple[int, ...] = (256, 128)
 
-        # DDPG algorithm
-        self.tau = 5e-3   # Soft update coefficient for target networks: slightly larger for faster target sync
-        self.gamma = 0.95 # Discount factor for future rewards: slightly higher to value long-term more
+    # --- DDPG ---------------------------------------------------------- #
+    tau: float = 5e-3
+    gamma: float = 0.95
 
-        # Optimizer
-        self.batch_size = 128                   # Number of transitions sampled from replay buffer per training update
-        self.buffer_size = 100000               # Maximum number of (s, a, r, s') transitions stored in replay memory
-        self.num_episodes = 1000                # Total number of training episodes
-        self.num_steps = 100                    # Number of recommendation steps per episode (total steps = 1000 * 100 = 100 000)
-        self.num_updates_per_step = 2           # Number of gradient updates per environment step
-        self.warmup_steps = 500                 # Fill buffer with random actions before any gradient update
-        self.embedding_weight_decay = 1e-6      # L2 regularization for Embedding optimizer (prevents large weights)
-        self.actor_weight_decay = 1e-6          # L2 regularization for Actor optimizer
-        self.critic_weight_decay = 1e-6         # L2 regularization for Critic optimizer
-        self.embedding_learning_rate = 5e-4     # Learning rate for Adam optimizer of Embedding network
-        self.actor_learning_rate = 1e-3         # Learning rate for Adam optimizer of Actor network
-        self.critic_learning_rate = 1e-3        # Learning rate for Adam optimizer of Critic network
-        self.eval_per_iter = 10                 # Run evaluation every N episodes
+    # --- Optimisation -------------------------------------------------- #
+    batch_size: int = 128
+    buffer_size: int = 100_000
+    max_episodes: int = 1000
+    steps_per_episode: int = 100
+    gradient_steps_per_env_step: int = 2
+    warmup_steps: int = 500
+    embedding_weight_decay: float = 1e-6
+    actor_weight_decay: float = 1e-6
+    critic_weight_decay: float = 1e-6
+    embedding_learning_rate: float = 5e-4
+    actor_learning_rate: float = 1e-3
+    critic_learning_rate: float = 1e-3
+    eval_interval_episodes: int = 10
 
-        # OU noise (Ornstein-Uhlenbeck process — correlated noise for continuous action space exploration)
-        self.ou_mu = 0.0      # Mean value the noise reverts to over time
-        self.ou_theta = 0.15  # Speed of mean reversion: how quickly noise returns to mu
-        self.ou_sigma = 0.3   # Volatility: amplitude of random fluctuations (increased for more exploration)
-        self.ou_epsilon = 1.0 # Initial noise scale (can be decayed over time to reduce exploration)
+    # --- OU noise ------------------------------------------------------ #
+    ou_mu: float = 0.0
+    ou_theta: float = 0.15
+    ou_sigma: float = 0.3
+    ou_epsilon: float = 1.0
 
-        # Entropy regularisation for Actor (prevents overconfident / collapsing policy)
-        self.entropy_coef = 0.05  # Weight of the entropy bonus added to the actor loss (increased)
+    # --- Entropy regularisation --------------------------------------- #
+    entropy_coef: float = 0.05
 
-        # Reward shaping coefficients
-        self.reward_diversity_alpha = 0.5   # Weight of diversity bonus (unique items in recommendation window)
-        self.reward_coverage_beta = 0.1     # Weight of coverage bonus (novel items not in history)
+    # --- Reward shaping ------------------------------------------------ #
+    reward_diversity_alpha: float = 0.5
+    reward_coverage_beta: float = 0.1
 
-        # Prioritized Experience Replay
-        self.per_alpha = 0.6            # Priority exponent (0 = uniform, 1 = full prioritisation)
-        self.per_beta_start = 0.4       # Initial IS-weight exponent (annealed to 1 over training)
-        self.per_beta_frames = 100_000  # Steps over which beta is annealed to 1.0
+    # --- Prioritised replay ------------------------------------------- #
+    per_alpha: float = 0.6
+    per_beta_start: float = 0.4
+    per_beta_frames: int = 100_000
 
-        # GPU
-        if torch.cuda.is_available():
-            print("Using GPU (CUDA acceleration enabled)")
-            self.device = torch.device("cuda:0")
-        else:
-            print("Using CPU")
-            self.device = torch.device("cpu")
+    # --- Derived (set in __post_init__) ------------------------------- #
+    state_size: int = field(init=False)
+    state_embedding_dim: int = field(init=False)
+    action_embedding_dim: int = field(init=False)
+    env_n_components: int = field(init=False)
+    device: torch.device = field(init=False)
 
     # ------------------------------------------------------------------ #
+    # Mapping of legacy attribute names → new names (used by from_yaml)   #
+    # ------------------------------------------------------------------ #
+    _LEGACY_FIELD_MAP: ClassVar[Dict[str, str]] = {
+        "data_folder_path": "dataset_dir",
+        "saves_folder_path": "checkpoint_dir",
+        "results_folder_path": "output_dir",
+        "top_K_list": "eval_top_k_values",
+        "num_episodes": "max_episodes",
+        "num_steps": "steps_per_episode",
+        "num_updates_per_step": "gradient_steps_per_env_step",
+        "eval_per_iter": "eval_interval_episodes",
+    }
+
+    # ================================================================== #
+    def __post_init__(self) -> None:
+        self._recompute_derived()
+        self.device = _resolve_device()
+
+    def _recompute_derived(self) -> None:
+        """(Re)compute fields derived from primary hyper-parameters."""
+        self.state_size = self.history_length + 1
+        self.state_embedding_dim = self.state_size * self.embedding_size
+        self.action_embedding_dim = self.action_size * self.embedding_size
+        self.env_n_components = self.embedding_size
+
+    # ------------------------------------------------------------------ #
+    # Path helpers                                                        #
+    # ------------------------------------------------------------------ #
+    @property
+    def item_path(self) -> str:
+        """Path to ``movies.dat``."""
+        return str(Path(self.dataset_dir) / "movies.dat")
+
+    @property
+    def user_path(self) -> str:
+        """Path to ``users.dat``."""
+        return str(Path(self.dataset_dir) / "users.dat")
+
+    @property
+    def group_path(self) -> str:
+        """Path to ``groupMember.dat``."""
+        return str(Path(self.dataset_dir) / "groupMember.dat")
+
+    # ------------------------------------------------------------------ #
+    # YAML loading                                                        #
+    # ------------------------------------------------------------------ #
     @classmethod
-    def from_yaml(cls, path: Optional[str]) -> "Config":
-        """
-        Build a Config and override fields from a YAML file.
+    def from_yaml(cls, path: Optional[str]) -> "TrainingConfig":
+        """Load a config from YAML, falling back to defaults for missing keys.
 
-        Any keys missing from the YAML keep their default values defined
-        in __init__. Tuple-valued fields (e.g. ``actor_hidden_sizes``) are
-        cast back to tuples for consistency. ``device`` is always
-        re-resolved at runtime regardless of YAML.
+        Args:
+            path: Path to a YAML file. ``None`` returns the defaults.
 
-        :param path: path to YAML file, or None to return defaults.
-        :return: Config instance
+        Returns:
+            A populated :class:`TrainingConfig` instance.
         """
-        config = cls()
         if not path:
-            return config
+            return cls()
         if yaml is None:
-            raise ImportError("PyYAML is required for Config.from_yaml(). "
-                              "Install with: pip install pyyaml")
-        with open(path, 'r') as fh:
-            data = yaml.safe_load(fh) or {}
+            raise ImportError(
+                "PyYAML is required for TrainingConfig.from_yaml(); "
+                "install it via `pip install pyyaml`."
+            )
 
-        tuple_fields = {"actor_hidden_sizes", "critic_hidden_sizes"}
-        for key, value in data.items():
-            if not hasattr(config, key):
+        with open(path, "r", encoding="utf-8") as fh:
+            payload: Dict[str, Any] = yaml.safe_load(fh) or {}
+
+        valid_field_names = {f.name for f in fields(cls) if f.init}
+        kwargs: Dict[str, Any] = {}
+
+        for raw_key, raw_value in payload.items():
+            key = cls._LEGACY_FIELD_MAP.get(raw_key, raw_key)
+            if key not in valid_field_names:
+                logger.warning("Ignoring unknown config key: %s", raw_key)
                 continue
-            if key in tuple_fields and isinstance(value, list):
-                value = tuple(value)
-            setattr(config, key, value)
+            value = (
+                tuple(raw_value)
+                if key in _TUPLE_FIELDS and isinstance(raw_value, list)
+                else raw_value
+            )
+            kwargs[key] = value
 
-        # Recompute derived values that depend on overridden fields
-        config.state_size = config.history_length + 1
-        config.embedded_state_size = config.state_size * config.embedding_size
-        config.embedded_action_size = config.action_size * config.embedding_size
-        return config
+        return cls(**kwargs)
+
+
+
 

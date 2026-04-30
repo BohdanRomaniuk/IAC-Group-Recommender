@@ -1,283 +1,411 @@
+"""DDPG agent for group recommendation.
+
+The :class:`DDPGRecommenderAgent` orchestrates the actor, critic, target
+networks, integrator (state encoder), prioritised replay buffer and OU
+exploration noise.
 """
-DDPG (Deep Deterministic Policy Gradient) Agent.
-"""
-from typing import List, Optional, Tuple
+from __future__ import annotations
+
+import logging
+from typing import Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
 import torch
-import torch.nn.functional as functional
+import torch.nn.functional as F
+from pytorch_optimizer import Ranger
 from torch import nn
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from pytorch_optimizer import Ranger
 
-from agent.replay_buffer import PrioritizedReplayBuffer
-from config import Config
+from agent.replay_buffer import PrioritizedExperienceReplay
+from config import TrainingConfig
 from models.actor import Actor
 from models.critic import Critic
-from models.integrator import Embedding
-from utils.noise import OUNoise
+from models.integrator import Integrator
+from utils.noise import OrnsteinUhlenbeckNoise
 
 
-class DDPGAgent(object):
-    """
-    DDPG Agent with prioritized replay and entropy-regularised actor.
-    """
+__all__ = ["DDPGRecommenderAgent"]
 
-    def __init__(self, config: Config, noise: OUNoise, group2members_dict: dict, verbose: bool = False):
-        """
-        Initialize DDPGAgent
+logger = logging.getLogger(__name__)
 
-        :param config: configurations
-        :param noise: OU noise instance
-        :param group2members_dict: group members data
-        :param verbose: True to print networks
+
+class DDPGRecommenderAgent:
+    """DDPG agent with prioritised replay and entropy-regularised actor."""
+
+    # ================================================================== #
+    # Construction                                                        #
+    # ================================================================== #
+    def __init__(
+        self,
+        config: TrainingConfig,
+        noise: OrnsteinUhlenbeckNoise,
+        group_to_members: dict,
+        verbose: bool = False,
+    ) -> None:
+        """Build all networks, optimisers, schedulers and the replay buffer.
+
+        Args:
+            config: Training configuration.
+            noise: OU noise instance for exploration.
+            group_to_members: Mapping ``group_id → tuple(user_ids)``.
+            verbose: When ``True``, log the network summaries.
+            **legacy_kwargs: Tolerates ``group2members_dict=`` callers.
         """
         self.config = config
         self.noise = noise
-        self.group2members_dict = group2members_dict
-        self.tau = config.tau
-        self.gamma = config.gamma
-        self.device = config.device
+        self.group_to_members = group_to_members
+        self.tau: float = config.tau
+        self.gamma: float = config.gamma
+        self.device: torch.device = config.device
 
-        self.embedding = Embedding(embedding_size=config.embedding_size,
-                                   user_num=config.user_num,
-                                   item_num=config.item_num).to(config.device)
-        self.actor = Actor(embedded_state_size=config.embedded_state_size,
-                           action_weight_size=config.embedded_action_size,
-                           hidden_sizes=config.actor_hidden_sizes).to(config.device)
-        self.actor_target = Actor(embedded_state_size=config.embedded_state_size,
-                                  action_weight_size=config.embedded_action_size,
-                                  hidden_sizes=config.actor_hidden_sizes).to(config.device)
-        self.critic = Critic(embedded_state_size=config.embedded_state_size,
-                             embedded_action_size=config.embedded_action_size,
-                             hidden_sizes=config.critic_hidden_sizes).to(config.device)
-        self.critic_target = Critic(embedded_state_size=config.embedded_state_size,
-                                    embedded_action_size=config.embedded_action_size,
-                                    hidden_sizes=config.critic_hidden_sizes).to(config.device)
+        self._build_networks(verbose=verbose)
+        self._build_buffer()
+        self._build_optimisers()
 
-        if verbose:
-            print(self.embedding)
-            print(self.actor)
-            print(self.critic)
+    # ------------------------------------------------------------------ #
+    def _build_networks(self, *, verbose: bool) -> None:
+        cfg = self.config
+        self.embedding = Integrator(
+            embedding_size=cfg.embedding_size,
+            user_num=cfg.user_num,
+            item_num=cfg.item_num,
+        ).to(self.device)
 
-        self.copy_network(self.actor, self.actor_target)
-        self.copy_network(self.critic, self.critic_target)
-
-        self.replay_memory = PrioritizedReplayBuffer(
-            buffer_size=config.buffer_size,
-            alpha=config.per_alpha,
-            beta_start=config.per_beta_start,
-            beta_frames=config.per_beta_frames,
+        actor_kwargs = dict(
+            embedded_state_size=cfg.state_embedding_dim,
+            action_weight_size=cfg.action_embedding_dim,
+            hidden_sizes=cfg.actor_hidden_sizes,
+        )
+        critic_kwargs = dict(
+            embedded_state_size=cfg.state_embedding_dim,
+            embedded_action_size=cfg.action_embedding_dim,
+            hidden_sizes=cfg.critic_hidden_sizes,
         )
 
-        self.critic_criterion = nn.MSELoss(reduction='none')
-        self.embedding_optimizer = Ranger(self.embedding.parameters(), lr=config.embedding_learning_rate,
-                                          weight_decay=config.embedding_weight_decay)
-        self.actor_optimizer = Ranger(self.actor.parameters(), lr=config.actor_learning_rate,
-                                      weight_decay=config.actor_weight_decay)
-        self.critic_optimizer = Ranger(self.critic.parameters(), lr=config.critic_learning_rate,
-                                       weight_decay=config.critic_weight_decay)
+        self.actor = Actor(**actor_kwargs).to(self.device)
+        self.actor_target = Actor(**actor_kwargs).to(self.device)
+        self.critic = Critic(**critic_kwargs).to(self.device)
+        self.critic_target = Critic(**critic_kwargs).to(self.device)
 
-        T_max = config.num_episodes
-        self.embedding_scheduler = CosineAnnealingLR(self.embedding_optimizer, T_max=T_max, eta_min=1e-5)
-        self.actor_scheduler = CosineAnnealingLR(self.actor_optimizer, T_max=T_max, eta_min=1e-5)
-        self.critic_scheduler = CosineAnnealingLR(self.critic_optimizer, T_max=T_max, eta_min=1e-5)
+        if verbose:
+            for module in (self.embedding, self.actor, self.critic):
+                logger.info("%s", module)
+
+        self.hard_update_target(self.actor, self.actor_target)
+        self.hard_update_target(self.critic, self.critic_target)
 
     # ------------------------------------------------------------------ #
-    #  Reward shaping                                                      #
-    # ------------------------------------------------------------------ #
+    def _build_buffer(self) -> None:
+        cfg = self.config
+        self.replay_buffer = PrioritizedExperienceReplay(
+            buffer_size=cfg.buffer_size,
+            alpha=cfg.per_alpha,
+            beta_start=cfg.per_beta_start,
+            beta_frames=cfg.per_beta_frames,
+        )
 
-    def shaped_reward(self, raw_reward: float, action: int, history: list) -> float:
-        """
-        Augment the environment reward with diversity and coverage bonuses.
+    # ------------------------------------------------------------------ #
+    def _build_optimisers(self) -> None:
+        cfg = self.config
+        self.critic_criterion = nn.MSELoss(reduction="none")
+
+        self.embedding_optimizer = Ranger(
+            self.embedding.parameters(),
+            lr=cfg.embedding_learning_rate,
+            weight_decay=cfg.embedding_weight_decay,
+        )
+        self.actor_optimizer = Ranger(
+            self.actor.parameters(),
+            lr=cfg.actor_learning_rate,
+            weight_decay=cfg.actor_weight_decay,
+        )
+        self.critic_optimizer = Ranger(
+            self.critic.parameters(),
+            lr=cfg.critic_learning_rate,
+            weight_decay=cfg.critic_weight_decay,
+        )
+
+        t_max = cfg.max_episodes
+        self.embedding_scheduler = CosineAnnealingLR(self.embedding_optimizer, T_max=t_max, eta_min=1e-5)
+        self.actor_scheduler = CosineAnnealingLR(self.actor_optimizer, T_max=t_max, eta_min=1e-5)
+        self.critic_scheduler = CosineAnnealingLR(self.critic_optimizer, T_max=t_max, eta_min=1e-5)
+
+    # ================================================================== #
+    # Reward shaping                                                      #
+    # ================================================================== #
+    def compute_shaped_reward(
+        self,
+        raw_reward: float,
+        action: int,
+        history: Sequence[int],
+    ) -> float:
+        """Augment the raw environment reward with diversity & coverage bonuses.
+
+        Args:
+            raw_reward: The reward delivered by the environment.
+            action: The recommended item id.
+            history: The current item history (excluding ``action``).
+
+        Returns:
+            The shaped reward.
         """
         alpha = self.config.reward_diversity_alpha
         beta = self.config.reward_coverage_beta
-
-        diversity = 1.0 if action not in history else 0.0
+        diversity = 0.0 if action in history else 1.0
         coverage = 1.0
+        return float(raw_reward) + alpha * diversity + beta * coverage
 
-        return raw_reward + alpha * diversity + beta * coverage
 
-    # ------------------------------------------------------------------ #
 
-    def copy_network(self, network: nn.Module, network_target: nn.Module) -> None:
-        """Copy one network to its target network."""
-        for parameters, target_parameters in zip(network.parameters(), network_target.parameters()):
-            target_parameters.data.copy_(parameters.data)
-
-    def sync_network(self, network: nn.Module, network_target: nn.Module) -> None:
-        """Soft-update target network weights."""
-        for parameters, target_parameters in zip(network.parameters(), network_target.parameters()):
-            target_parameters.data.copy_(parameters.data * self.tau + target_parameters.data * (1 - self.tau))
-
-    def get_action(self, state: list, item_candidates: Optional[list] = None,
-                   top_K: int = 1, with_noise: bool = False):
-        """Get one action."""
+    # ================================================================== #
+    # Target-network synchronisation                                      #
+    # ================================================================== #
+    @staticmethod
+    def hard_update_target(source: nn.Module, target: nn.Module) -> None:
+        """Copy ``source`` parameters into ``target`` in place."""
         with torch.no_grad():
-            states = [state]
-            embedded_states = self.embed_states(states)
-            action_weights = self.actor(embedded_states)
-            action_weight = torch.squeeze(action_weights)
+            for p_src, p_tgt in zip(source.parameters(), target.parameters()):
+                p_tgt.data.copy_(p_src.data)
+
+    def soft_update_target(self, source: nn.Module, target: nn.Module) -> None:
+        """Polyak-average ``source`` into ``target`` using ``τ``."""
+        with torch.no_grad():
+            for p_src, p_tgt in zip(source.parameters(), target.parameters()):
+                p_tgt.data.mul_(1.0 - self.tau).add_(p_src.data, alpha=self.tau)
+
+
+
+    # ================================================================== #
+    # Action selection                                                    #
+    # ================================================================== #
+    def select_action(
+        self,
+        state: list,
+        item_candidates: Optional[Sequence[int]] = None,
+        top_k: int = 1,
+        with_noise: bool = False,
+    ):
+        """Pick the top-``k`` items for the supplied state.
+
+        Args:
+            state: ``[group_id, *history_items]``.
+            item_candidates: Optional candidate set; if ``None`` all items
+                in the catalogue are scored.
+            top_k: Number of items to recommend.
+            with_noise: Add OU exploration noise to the action weight.
+
+        Returns:
+            A scalar item id when ``top_k == 1``, otherwise a numpy array.
+        """
+        with torch.no_grad():
+            embedded_state = self.encode_state_batch([state])
+            action_weight = torch.squeeze(self.actor(embedded_state))
+
             if with_noise:
-                action_weight = action_weight + self.noise.get_ou_noise().to(action_weight.device)
+                action_weight = action_weight + self.noise.sample().to(action_weight.device)
 
             if item_candidates is None:
-                item_embedding_weight = self.embedding.item_embedding.weight.clone()
+                item_weights = self.embedding.item_embedding.weight.clone()
             else:
-                item_candidates = np.array(item_candidates)
-                item_candidates_tensor = torch.tensor(item_candidates, dtype=torch.int).to(self.device)
-                item_embedding_weight = self.embedding.item_embedding(item_candidates_tensor)
+                item_candidates = np.asarray(item_candidates)
+                idx_tensor = torch.as_tensor(item_candidates, dtype=torch.int, device=self.device)
+                item_weights = self.embedding.item_embedding(idx_tensor)
 
-            scores = torch.inner(action_weight, item_embedding_weight).detach().cpu().numpy()
-            sorted_score_indices = np.argsort(scores)[::-1][:top_K].copy()
+            scores = torch.inner(action_weight, item_weights).detach().cpu().numpy()
+            top_indices = np.argsort(scores)[::-1][:top_k].copy()
 
-            if item_candidates is None:
-                action = sorted_score_indices
-            else:
-                action = item_candidates[sorted_score_indices]
-            action = np.squeeze(action)
-            if top_K == 1:
-                action = action.item()
-        return action
+            chosen = top_indices if item_candidates is None else item_candidates[top_indices]
+            chosen = np.squeeze(chosen)
+            if top_k == 1:
+                chosen = chosen.item()
+            return chosen
 
-    def get_embedded_actions(self, embedded_states: torch.Tensor, target: bool = False) -> torch.Tensor:
-        """Get embedded actions."""
-        if not target:
-            action_weights = self.actor(embedded_states)
-        else:
-            action_weights = self.actor_target(embedded_states)
 
-        item_embedding_weight = self.embedding.item_embedding.weight.clone()
-        scores = torch.inner(action_weights, item_embedding_weight)
-        embedded_actions = torch.inner(functional.gumbel_softmax(scores, hard=True), item_embedding_weight.t())
-        return embedded_actions
 
-    def embed_state(self, state: list) -> torch.Tensor:
-        """Embed one state."""
+    # ================================================================== #
+    # State / action encoding                                             #
+    # ================================================================== #
+    def encode_state(self, state: list) -> torch.Tensor:
+        """Encode a single state vector ``[group_id, *history]``."""
         group_id = state[0]
-        group_members = torch.tensor(self.group2members_dict[group_id], dtype=torch.int).to(self.device)
-        history = torch.tensor(state[1:], dtype=torch.int).to(self.device)
-        embedded_state = self.embedding(group_members, history)
-        return embedded_state
+        members = torch.as_tensor(self.group_to_members[group_id], dtype=torch.int, device=self.device)
+        history = torch.as_tensor(state[1:], dtype=torch.int, device=self.device)
+        return self.embedding(members, history)
 
-    def embed_states(self, states: List[list]) -> torch.Tensor:
-        """Embed states."""
-        embedded_states = torch.stack([self.embed_state(state) for state in states], dim=0)
-        return embedded_states
+    def encode_state_batch(self, states: Iterable[list]) -> torch.Tensor:
+        """Encode a batch of states by stacking individual encodings."""
+        return torch.stack([self.encode_state(s) for s in states], dim=0)
 
-    def embed_actions(self, actions: list) -> torch.Tensor:
-        """Embed actions."""
-        actions_t = torch.tensor(actions, dtype=torch.int).to(self.device)
-        embedded_actions = self.embedding.item_embedding(actions_t)
-        return embedded_actions
+    def encode_actions(self, actions: Sequence[int]) -> torch.Tensor:
+        """Look up item embeddings for a batch of action ids."""
+        action_t = torch.as_tensor(actions, dtype=torch.int, device=self.device)
+        return self.embedding.item_embedding(action_t)
 
+    def compute_embedded_actions(
+        self,
+        embedded_states: torch.Tensor,
+        target: bool = False,
+    ) -> torch.Tensor:
+        """Differentiable item selection via Gumbel-softmax.
+
+        Args:
+            embedded_states: Tensor of encoded states.
+            target: If ``True`` use the target actor; otherwise the live actor.
+        """
+        actor = self.actor_target if target else self.actor
+        action_weights = actor(embedded_states)
+        item_weights = self.embedding.item_embedding.weight.clone()
+        scores = torch.inner(action_weights, item_weights)
+        soft_one_hot = F.gumbel_softmax(scores, hard=True)
+        return torch.inner(soft_one_hot, item_weights.t())
+
+
+
+    # ================================================================== #
+    # Optimisation                                                        #
+    # ================================================================== #
     def update(self) -> Tuple[float, float]:
-        """
-        Update the networks using a prioritized batch.
-        Critic loss is weighted by IS weights to correct the sampling bias.
-        Actor loss includes an entropy regularisation term.
+        """Run one DDPG optimisation step.
 
-        :return: actor loss and critic loss
+        Decomposed internally into :meth:`_update_critic` and
+        :meth:`_update_actor`. The public method name is preserved for
+        backward compatibility.
+
+        Returns:
+            ``(actor_loss, critic_loss)`` as Python floats.
         """
-        batch, per_indices, is_weights = self.replay_memory.sample(self.config.batch_size)
-        is_weights = is_weights.to(self.device).unsqueeze(-1)  # [B, 1]
+        batch, priority_indices, importance_weights = self.replay_buffer.sample(self.config.batch_size)
+        importance_weights = importance_weights.to(self.device).unsqueeze(-1)  # [B, 1]
 
         states, actions, rewards, next_states = list(zip(*batch))
 
-        # ---- Critic update -------------------------------------------- #
+        critic_loss, embedded_states = self._update_critic(
+            states=list(states),
+            actions=list(actions),
+            rewards=list(rewards),
+            next_states=list(next_states),
+            importance_weights=importance_weights,
+            priority_indices=priority_indices,
+        )
+        actor_loss = self._update_actor(states=list(states))
+
+        # Polyak averaging
+        self.soft_update_target(self.actor, self.actor_target)
+        self.soft_update_target(self.critic, self.critic_target)
+
+        return actor_loss, critic_loss
+
+    # ------------------------------------------------------------------ #
+    def _update_critic(
+        self,
+        states: List[list],
+        actions: List[int],
+        rewards: List[float],
+        next_states: List[list],
+        importance_weights: torch.Tensor,
+        priority_indices: np.ndarray,
+    ) -> Tuple[float, torch.Tensor]:
+        """One critic gradient step. Returns ``(loss, embedded_states)``."""
         self.critic_optimizer.zero_grad()
 
-        embedded_states = self.embed_states(states)
-        embedded_actions = self.embed_actions(actions)
-        rewards_t = torch.unsqueeze(torch.tensor(rewards, dtype=torch.float).to(self.device), dim=-1)
+        embedded_states = self.encode_state_batch(states)
+        embedded_actions = self.encode_actions(actions)
+        rewards_t = torch.as_tensor(rewards, dtype=torch.float, device=self.device).unsqueeze(-1)
 
         with torch.no_grad():
-            embedded_next_states = self.embed_states(next_states)
-            embedded_next_actions = self.get_embedded_actions(embedded_next_states, target=True)
-            next_q_values = self.critic_target(embedded_next_states, embedded_next_actions)
-            q_values_target = rewards_t + self.gamma * next_q_values
+            embedded_next_states = self.encode_state_batch(next_states)
+            embedded_next_actions = self.compute_embedded_actions(embedded_next_states, target=True)
+            target_q = rewards_t + self.gamma * self.critic_target(embedded_next_states, embedded_next_actions)
 
         q_values = self.critic(embedded_states, embedded_actions)
+        per_sample_loss = self.critic_criterion(q_values, target_q)
+        loss = (importance_weights * per_sample_loss).mean()
 
-        per_sample_loss = self.critic_criterion(q_values, q_values_target)  # [B, 1]
-        critic_loss = (is_weights * per_sample_loss).mean()
-        critic_loss.backward()
+        loss.backward()
         torch.nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=1.0)
         self.critic_optimizer.step()
 
-        td_errors = (q_values - q_values_target).abs().detach().cpu().numpy().flatten()
-        self.replay_memory.update_priorities(per_indices, td_errors)
+        # Refresh priorities
+        td_errors = (q_values - target_q).abs().detach().cpu().numpy().flatten()
+        self.replay_buffer.update_priorities(priority_indices, td_errors)
 
-        # ---- Actor + Embedding update --------------------------------- #
+        return float(loss.detach().cpu().item()), embedded_states.detach()
+
+    # ------------------------------------------------------------------ #
+    def _update_actor(self, states: List[list]) -> float:
+        """One actor + integrator gradient step. Returns the actor loss."""
         self.actor_optimizer.zero_grad()
         self.embedding_optimizer.zero_grad()
 
-        embedded_states = self.embed_states(states)
-
+        embedded_states = self.encode_state_batch(states)
         action_weights = self.actor(embedded_states)
         item_emb = self.embedding.item_embedding.weight
         scores = torch.inner(action_weights, item_emb)
+
         log_probs = torch.log_softmax(scores, dim=-1)
         probs = log_probs.exp()
         entropy = -(probs * log_probs).sum(dim=-1).mean()
 
-        embedded_actions_actor = self.get_embedded_actions(embedded_states)
-        q_for_actor = self.critic(embedded_states, embedded_actions_actor).mean()
+        embedded_actions = self.compute_embedded_actions(embedded_states)
+        q_for_actor = self.critic(embedded_states, embedded_actions).mean()
 
-        actor_loss = -q_for_actor - self.config.entropy_coef * entropy
-        actor_loss.backward()
+        loss = -q_for_actor - self.config.entropy_coef * entropy
+        loss.backward()
         torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=1.0)
         torch.nn.utils.clip_grad_norm_(self.embedding.parameters(), max_norm=1.0)
         self.actor_optimizer.step()
         self.embedding_optimizer.step()
 
-        self.sync_network(self.actor, self.actor_target)
-        self.sync_network(self.critic, self.critic_target)
+        return float(loss.detach().cpu().item())
 
-        actor_loss_val = float(actor_loss.detach().cpu().numpy())
-        critic_loss_val = float(critic_loss.detach().cpu().numpy())
+    # ================================================================== #
+    # Validation diagnostics                                              #
+    # ================================================================== #
+    def evaluate_loss(
+        self,
+        df_eval: pd.DataFrame,
+    ) -> Tuple[Optional[float], Optional[float]]:
+        """Compute actor and critic losses on held-out evaluation data.
 
-        return actor_loss_val, critic_loss_val
+        No network weights are updated. Public method name kept stable.
 
-    def evaluate_loss(self, df_eval: pd.DataFrame) -> Tuple[Optional[float], Optional[float]]:
-        """
-        Compute actor and critic losses on held-out evaluation data
-        without updating any network weights.
+        Args:
+            df_eval: Evaluation dataframe containing ``group``, ``history``
+                and ``action`` columns.
+
+        Returns:
+            ``(actor_loss, critic_loss)`` or ``(None, None)`` if ``df_eval``
+            is empty.
         """
         if df_eval is None or (isinstance(df_eval, pd.DataFrame) and df_eval.empty):
             return None, None
 
-        rows = df_eval.sample(n=min(self.config.batch_size, len(df_eval)), replace=False)
+        sample_n = min(self.config.batch_size, len(df_eval))
+        rows = df_eval.sample(n=sample_n, replace=False)
 
-        states, actions, next_states = [], [], []
+        states: List[list] = []
+        actions: List[int] = []
+        next_states: List[list] = []
         for _, row in rows.iterrows():
-            group = row['group']
-            history = list(row['history'])
-            action = row['action']
-
-            state = [group] + history
-            next_history = history[1:] + [action]
-            next_state = [group] + next_history
-
-            states.append(state)
+            group = row["group"]
+            history = list(row["history"])
+            action = row["action"]
+            states.append([group] + history)
             actions.append(action)
-            next_states.append(next_state)
+            next_states.append([group] + history[1:] + [action])
 
         with torch.no_grad():
-            embedded_states = self.embed_states(states)
-            embedded_actions = self.embed_actions(actions)
-            rewards_t = torch.ones(len(states), 1, dtype=torch.float).to(self.device)
-            embedded_next_states = self.embed_states(next_states)
+            embedded_states = self.encode_state_batch(states)
+            embedded_actions = self.encode_actions(actions)
+            rewards_t = torch.ones(len(states), 1, dtype=torch.float, device=self.device)
+            embedded_next_states = self.encode_state_batch(next_states)
 
             q_values = self.critic(embedded_states, embedded_actions)
-            embedded_next_actions = self.get_embedded_actions(embedded_next_states, target=True)
-            next_q_values = self.critic_target(embedded_next_states, embedded_next_actions)
-            q_values_target = rewards_t + self.gamma * next_q_values
+            embedded_next_actions = self.compute_embedded_actions(embedded_next_states, target=True)
+            target_q = rewards_t + self.gamma * self.critic_target(embedded_next_states, embedded_next_actions)
 
-            eval_criterion = nn.MSELoss()
-            critic_loss = float(eval_criterion(q_values, q_values_target).cpu().numpy())
+            critic_loss = float(F.mse_loss(q_values, target_q).cpu().item())
 
             action_weights = self.actor(embedded_states)
             item_emb = self.embedding.item_embedding.weight.clone()
@@ -286,9 +414,14 @@ class DDPGAgent(object):
             probs = log_probs.exp()
             entropy = -(probs * log_probs).sum(dim=-1).mean()
 
-            embedded_actions_actor = self.get_embedded_actions(embedded_states)
+            embedded_actions_actor = self.compute_embedded_actions(embedded_states)
             q_for_actor = self.critic(embedded_states, embedded_actions_actor).mean()
-            actor_loss = float((-q_for_actor - self.config.entropy_coef * entropy).cpu().numpy())
+            actor_loss = float((-q_for_actor - self.config.entropy_coef * entropy).cpu().item())
 
         return actor_loss, critic_loss
+
+
+
+
+
 

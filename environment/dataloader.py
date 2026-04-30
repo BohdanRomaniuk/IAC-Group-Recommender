@@ -1,200 +1,332 @@
+"""Data loading utilities for the MovieLens group-recommendation datasets.
+
+Provides :class:`MovieLensDatasetLoader` which parses the ``.dat`` files,
+builds rating matrices and constructs the evaluation dataframes (with
+negative samples) used by the trainer.
 """
-Data loading utilities.
-"""
-import os
-from collections import deque, defaultdict
-from typing import Dict, Tuple
+from __future__ import annotations
+
+import logging
+from collections import defaultdict, deque
+from pathlib import Path
+from typing import Deque, Dict, List, Tuple
 
 import pandas as pd
-from scipy.sparse import coo_matrix
+from scipy.sparse import coo_matrix, csr_matrix
 
-from config import Config
+from config import TrainingConfig
 
 
-class DataLoader(object):
-    """
-    Data Loader for the MovieLens group-recommendation datasets.
-    """
+__all__ = ["MovieLensDatasetLoader"]
 
-    def __init__(self, config: Config):
-        """
-        Initialize DataLoader
+logger = logging.getLogger(__name__)
 
-        :param config: configurations
+
+# ---------------------------------------------------------------------- #
+# Column-name constants                                                   #
+# ---------------------------------------------------------------------- #
+COL_GROUP_ID = "GroupID"
+COL_MOVIE_ID = "MovieID"
+COL_RATING = "Rating"
+COL_TIMESTAMP = "Timestamp"
+COL_MEMBERS = "Members"
+
+VALID_MODES: Tuple[str, ...] = ("user", "group")
+VALID_SPLITS: Tuple[str, ...] = ("train", "val", "test")
+EVAL_SPLITS: Tuple[str, ...] = ("val", "test")
+
+
+class MovieLensDatasetLoader:
+    """Reader / pre-processor for the MovieLens group-recommendation files."""
+
+    # ================================================================== #
+    def __init__(self, config: TrainingConfig) -> None:
+        """Pre-load cardinalities and build group bookkeeping.
+
+        Args:
+            config: Training configuration whose ``item_num``, ``user_num``,
+                ``group_num`` and ``total_group_num`` are filled in here.
         """
         self.config = config
-        self.history_length = config.history_length
-        self.item_num = self.get_item_num()
-        self.user_num = self.get_user_num()
-        self.group_num, self.total_group_num, self.group2members_dict, self.user2group_dict = self.get_groups()
+        self.history_length: int = config.history_length
 
-        if not os.path.exists(self.config.saves_folder_path):
-            os.mkdir(self.config.saves_folder_path)
+        self.item_num: int = self._count_items()
+        self.user_num: int = self._count_users()
+        (
+            self.group_num,
+            self.total_group_num,
+            self.group_to_members,
+            self.user_to_group_id,
+        ) = self._build_group_mappings()
 
-    def get_item_num(self) -> int:
-        """Get number of items."""
-        df_item = pd.read_csv(self.config.item_path, sep='::', index_col=0, engine='python', encoding='iso-8859-1')
-        self.config.item_num = df_item.index.max()
-        return self.config.item_num
+        Path(self.config.checkpoint_dir).mkdir(parents=True, exist_ok=True)
 
-    def get_user_num(self) -> int:
-        """Get number of users."""
-        df_user = pd.read_csv(self.config.user_path, sep='::', index_col=0, engine='python')
-        self.config.user_num = df_user.index.max()
-        return self.config.user_num
+    # ================================================================== #
+    # Cardinalities                                                       #
+    # ================================================================== #
+    def _count_items(self) -> int:
+        """Largest item id in ``movies.dat``."""
+        df = pd.read_csv(
+            self.config.item_path,
+            sep="::",
+            index_col=0,
+            engine="python",
+            encoding="iso-8859-1",
+        )
+        item_num = int(df.index.max())
+        self.config.item_num = item_num
+        return item_num
 
-    def get_groups(self) -> Tuple[int, int, dict, dict]:
-        """Get number of groups and group members."""
-        df_group = pd.read_csv(self.config.group_path, sep=' ', header=None, index_col=None,
-                               names=['GroupID', 'Members'])
-        df_group['Members'] = df_group['Members']. \
-            apply(lambda group_members: tuple(map(int, group_members.split(','))))
-        group_num = df_group['GroupID'].max()
+    def _count_users(self) -> int:
+        """Largest user id in ``users.dat``."""
+        df = pd.read_csv(self.config.user_path, sep="::", index_col=0, engine="python")
+        user_num = int(df.index.max())
+        self.config.user_num = user_num
+        return user_num
 
-        users = set()
-        for members in df_group['Members']:
-            users.update(members)
-        users = sorted(users)
-        total_group_num = group_num + len(users)
+    # ================================================================== #
+    # Groups                                                              #
+    # ================================================================== #
+    def _build_group_mappings(self) -> Tuple[int, int, Dict[int, tuple], Dict[int, int]]:
+        """Build ``group → members`` and ``user → group_id`` lookups.
 
-        df_user_group = pd.DataFrame()
-        df_user_group['GroupID'] = list(range(group_num + 1, total_group_num + 1))
-        df_user_group['Members'] = [(user,) for user in users]
-        df_group = pd.concat([df_group, df_user_group], ignore_index=True)
-        group2members_dict = {row['GroupID']: row['Members'] for _, row in df_group.iterrows()}
-        user2group_dict = {user: group_num + user_index + 1 for user_index, user in enumerate(users)}
+        Synthetic singleton "user-only groups" are appended after the real
+        group list so that user-mode evaluation can reuse the same code
+        paths as group mode.
+        """
+        df_group = pd.read_csv(
+            self.config.group_path,
+            sep=" ",
+            header=None,
+            index_col=None,
+            names=[COL_GROUP_ID, COL_MEMBERS],
+        )
+        df_group[COL_MEMBERS] = df_group[COL_MEMBERS].apply(
+            lambda raw: tuple(int(uid) for uid in raw.split(","))
+        )
+        group_num = int(df_group[COL_GROUP_ID].max())
+
+        unique_users = sorted({uid for members in df_group[COL_MEMBERS] for uid in members})
+        total_group_num = group_num + len(unique_users)
+
+        df_user_groups = pd.DataFrame(
+            {
+                COL_GROUP_ID: range(group_num + 1, total_group_num + 1),
+                COL_MEMBERS: [(uid,) for uid in unique_users],
+            }
+        )
+        df_combined = pd.concat([df_group, df_user_groups], ignore_index=True)
+
+        group_to_members: Dict[int, tuple] = {
+            int(row[COL_GROUP_ID]): row[COL_MEMBERS] for _, row in df_combined.iterrows()
+        }
+        user_to_group_id: Dict[int, int] = {
+            uid: group_num + idx + 1 for idx, uid in enumerate(unique_users)
+        }
 
         self.config.group_num = group_num
         self.config.total_group_num = total_group_num
-        return group_num, total_group_num, group2members_dict, user2group_dict
+        return group_num, total_group_num, group_to_members, user_to_group_id
 
-    def load_rating_data(self, mode: str, dataset_name: str, is_appended: bool = True) -> pd.DataFrame:
-        """Load rating data."""
-        assert (mode in ['user', 'group']) and (dataset_name in ['train', 'val', 'test'])
-        rating_path = os.path.join(self.config.data_folder_path, mode + 'Rating' + dataset_name.capitalize() + '.dat')
-        df_rating_append = pd.read_csv(rating_path, sep=' ', header=None, index_col=None,
-                                       names=['GroupID', 'MovieID', 'Rating', 'Timestamp'])
-        print('Read data:', rating_path)
+    # ================================================================== #
+    # Raw rating loading                                                  #
+    # ================================================================== #
+    def load_ratings(
+        self,
+        mode: str,
+        dataset_name: str,
+        is_appended: bool = True,
+    ) -> pd.DataFrame:
+        """Load a rating split, optionally concatenated with prior splits.
 
-        if is_appended:
-            if dataset_name == 'train':
-                df_rating = df_rating_append
-            elif dataset_name == 'val':
-                df_rating = self.load_rating_data(mode=mode, dataset_name='train')
-                df_rating = pd.concat([df_rating, df_rating_append], ignore_index=True)
-            else:
-                df_rating = self.load_rating_data(mode=mode, dataset_name='val')
-                df_rating = pd.concat([df_rating, df_rating_append], ignore_index=True)
-        else:
-            df_rating = df_rating_append
+        Args:
+            mode: ``'user'`` or ``'group'``.
+            dataset_name: ``'train'``, ``'val'`` or ``'test'``.
+            is_appended: If ``True`` (default) ``val`` includes ``train``
+                rows and ``test`` includes ``train + val`` rows.
 
-        return df_rating
+        Returns:
+            A pandas dataframe with columns ``GroupID``, ``MovieID``,
+            ``Rating``, ``Timestamp``.
+        """
+        self._check_mode_split(mode, dataset_name, splits=VALID_SPLITS)
 
-    def _load_rating_matrix(self, df_rating: pd.DataFrame):
-        """Load rating matrix."""
-        group_ids = df_rating['GroupID']
-        item_ids = df_rating['MovieID']
-        ratings = df_rating['Rating']
-        rating_matrix = coo_matrix((ratings, (group_ids, item_ids)),
-                                   shape=(self.total_group_num + 1, self.config.item_num + 1)).tocsr()
-        return rating_matrix
+        rating_path = (
+            Path(self.config.dataset_dir)
+            / f"{mode}Rating{dataset_name.capitalize()}.dat"
+        )
+        df_split = pd.read_csv(
+            rating_path,
+            sep=" ",
+            header=None,
+            index_col=None,
+            names=[COL_GROUP_ID, COL_MOVIE_ID, COL_RATING, COL_TIMESTAMP],
+        )
+        logger.info("Read data: %s", rating_path)
 
-    def load_rating_matrix(self, dataset_name: str):
-        """Load group rating matrix."""
-        assert dataset_name in ['train', 'val', 'test']
+        if not is_appended or dataset_name == "train":
+            return df_split
 
-        df_user_rating = self.user2group(self.load_rating_data(mode='user', dataset_name=dataset_name))
-        df_group_rating = self.load_rating_data(mode='group', dataset_name=dataset_name)
-        df_group_rating = pd.concat([df_group_rating, df_user_rating], ignore_index=True)
-        rating_matrix = self._load_rating_matrix(df_group_rating)
+        prior_split = "train" if dataset_name == "val" else "val"
+        prior = self.load_ratings(mode=mode, dataset_name=prior_split)
+        return pd.concat([prior, df_split], ignore_index=True)
 
-        return rating_matrix
+    # ================================================================== #
+    # Sparse rating-matrix construction                                   #
+    # ================================================================== #
+    def _build_sparse_matrix(self, df_rating: pd.DataFrame) -> csr_matrix:
+        """Materialise the sparse ``(group, item) → rating`` matrix."""
+        rows = df_rating[COL_GROUP_ID].to_numpy()
+        cols = df_rating[COL_MOVIE_ID].to_numpy()
+        values = df_rating[COL_RATING].to_numpy()
+        shape = (self.total_group_num + 1, self.config.item_num + 1)
+        return coo_matrix((values, (rows, cols)), shape=shape).tocsr()
 
-    def user2group(self, df_user_rating: pd.DataFrame) -> pd.DataFrame:
-        """Change user ids to group ids."""
-        df_user_rating['GroupID'] = df_user_rating['GroupID'].apply(lambda user_id: self.user2group_dict[user_id])
+    def build_rating_matrix(self, dataset_name: str) -> csr_matrix:
+        """Build the combined (user-as-group + group) rating matrix."""
+        if dataset_name not in VALID_SPLITS:
+            raise ValueError(f"dataset_name must be one of {VALID_SPLITS}, got {dataset_name!r}")
+
+        df_user = self._map_user_ids_to_group_ids(self.load_ratings("user", dataset_name))
+        df_group = self.load_ratings("group", dataset_name)
+        df_all = pd.concat([df_group, df_user], ignore_index=True)
+        return self._build_sparse_matrix(df_all)
+
+    def _map_user_ids_to_group_ids(self, df_user_rating: pd.DataFrame) -> pd.DataFrame:
+        """Replace user ids with their synthetic singleton-group ids."""
+        df_user_rating[COL_GROUP_ID] = df_user_rating[COL_GROUP_ID].map(self.user_to_group_id)
         return df_user_rating
 
-    def _load_eval_data(self, df_data_train: pd.DataFrame, df_data_eval: pd.DataFrame,
-                        negative_samples_dict: Dict[tuple, list]) -> pd.DataFrame:
-        """Build evaluation dataframe."""
-        df_eval = pd.DataFrame()
-        last_state_dict = defaultdict(list)
-        groups = []
-        histories = []
-        actions = []
-        negative_samples = []
+    # ================================================================== #
+    # Negative sampling                                                   #
+    # ================================================================== #
+    def _load_negative_samples(self, mode: str, dataset_name: str) -> Dict[Tuple[int, int], List[int]]:
+        """Parse the ``*Negative.dat`` file for the given split."""
+        self._check_mode_split(mode, dataset_name, splits=EVAL_SPLITS)
+        path = (
+            Path(self.config.dataset_dir)
+            / f"{mode}Rating{dataset_name.capitalize()}Negative.dat"
+        )
 
-        for group_id, rating_group in df_data_train.groupby(['GroupID']):
-            rating_group.sort_values(by=['Timestamp'], ascending=True, ignore_index=True, inplace=True)
-            state = rating_group[rating_group['Rating'] == 1]['MovieID'].values.tolist()
-            last_state_dict[group_id] = state[-self.config.history_length:]
+        result: Dict[Tuple[int, int], List[int]] = {}
+        with open(path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                tokens = line.split()
+                if not tokens:
+                    continue
+                head = tokens[0][1:-1].split(",")
+                group_id = int(head[0])
+                if mode == "user":
+                    group_id = self.user_to_group_id[group_id]
+                item_id = int(head[1])
+                result[(group_id, item_id)] = list(map(int, tokens[1:]))
+        return result
 
-        for group_id, rating_group in df_data_eval.groupby(['GroupID']):
+    # ================================================================== #
+    # Evaluation dataframe construction                                   #
+    # ================================================================== #
+    def _construct_eval_dataframe(
+        self,
+        df_train: pd.DataFrame,
+        df_eval: pd.DataFrame,
+        negatives: Dict[Tuple[int, int], List[int]],
+    ) -> pd.DataFrame:
+        """Build the per-action evaluation dataframe used by the agent."""
+        last_state: Dict[int, List[int]] = defaultdict(list)
+        groups: List[int] = []
+        histories: List[List[int]] = []
+        actions: List[int] = []
+        negs: List[List[int]] = []
+
+        for group_id, rows in df_train.groupby([COL_GROUP_ID]):
+            rows = rows.sort_values(COL_TIMESTAMP, ascending=True, ignore_index=True)
+            positives = rows[rows[COL_RATING] == 1][COL_MOVIE_ID].tolist()
+            last_state[group_id] = positives[-self.history_length:]
+
+        for group_id, rows in df_eval.groupby([COL_GROUP_ID]):
             group_id = group_id[0]  # tuple → int
-            rating_group.sort_values(by=['Timestamp'], ascending=True, ignore_index=True, inplace=True)
-            action = rating_group[rating_group['Rating'] == 1]['MovieID'].values.tolist()
-            state = deque(maxlen=self.history_length)
-            state.extend(last_state_dict[group_id])
-            for item_id in action:
-                if len(state) == self.config.history_length:
+            rows = rows.sort_values(COL_TIMESTAMP, ascending=True, ignore_index=True)
+            positives = rows[rows[COL_RATING] == 1][COL_MOVIE_ID].tolist()
+
+            window: Deque[int] = deque(maxlen=self.history_length)
+            window.extend(last_state[group_id])
+
+            for item_id in positives:
+                if len(window) == self.history_length:
                     groups.append(group_id)
-                    histories.append(list(state))
+                    histories.append(list(window))
                     actions.append(item_id)
-                    negative_samples.append(negative_samples_dict[(group_id, item_id)])
-                state.append(item_id)
+                    negs.append(negatives[(group_id, item_id)])
+                window.append(item_id)
 
-        df_eval['group'] = groups
-        df_eval['history'] = histories
-        df_eval['action'] = actions
-        df_eval['negative samples'] = negative_samples
+        return pd.DataFrame(
+            {
+                "group": groups,
+                "history": histories,
+                "action": actions,
+                "negative samples": negs,
+            }
+        )
 
-        return df_eval
+    # ================================================================== #
+    # Public evaluation API                                               #
+    # ================================================================== #
+    def get_evaluation_data(
+        self,
+        mode: str,
+        dataset_name: str,
+        reload: bool = False,
+    ) -> pd.DataFrame:
+        """Load (or build & cache) the evaluation dataframe for ``dataset_name``.
 
-    def load_negative_samples(self, mode: str, dataset_name: str) -> Dict[tuple, list]:
-        """Load negative samples."""
-        assert (mode in ['user', 'group']) and (dataset_name in ['val', 'test'])
-        negative_samples_path = os.path.join(self.config.data_folder_path, mode + 'Rating'
-                                             + dataset_name.capitalize() + 'Negative.dat')
-        negative_samples_dict: Dict[tuple, list] = {}
+        Args:
+            mode: ``'user'`` or ``'group'``.
+            dataset_name: ``'val'`` or ``'test'``.
+            reload: When ``True`` rebuild even if a cache exists.
 
-        with open(negative_samples_path, 'r') as negative_samples_file:
-            for line in negative_samples_file.readlines():
-                negative_samples = line.split()
-                ids = negative_samples[0][1:-1].split(',')
-                group_id = int(ids[0])
-                if mode == 'user':
-                    group_id = self.user2group_dict[group_id]
-                item_id = int(ids[1])
-                negative_samples = list(map(int, negative_samples[1:]))
-                negative_samples_dict[(group_id, item_id)] = negative_samples
+        Returns:
+            A pandas dataframe ready for the evaluator/trainer.
+        """
+        self._check_mode_split(mode, dataset_name, splits=EVAL_SPLITS)
 
-        return negative_samples_dict
+        cache_path = (
+            Path(self.config.checkpoint_dir)
+            / f"eval_{mode}_{dataset_name}_{self.config.history_length}.pkl"
+        )
 
-    def load_eval_data(self, mode: str, dataset_name: str, reload: bool = False) -> pd.DataFrame:
-        """Load evaluation data."""
-        assert (mode in ['user', 'group']) and (dataset_name in ['val', 'test'])
-        exp_eval_path = os.path.join(self.config.saves_folder_path, 'eval_' + mode + '_' + dataset_name + '_'
-                                     + str(self.config.history_length) + '.pkl')
+        if cache_path.exists() and not reload:
+            df_eval = pd.read_pickle(cache_path)
+            logger.info("Load data: %s", cache_path)
+            return df_eval
 
-        if reload or not os.path.exists(exp_eval_path):
-            if dataset_name == 'val':
-                df_rating_train = self.load_rating_data(mode=mode, dataset_name='train')
-            else:
-                df_rating_train = self.load_rating_data(mode=mode, dataset_name='val')
-            df_rating_eval = self.load_rating_data(mode=mode, dataset_name=dataset_name, is_appended=False)
+        prior_split = "train" if dataset_name == "val" else "val"
+        df_train = self.load_ratings(mode=mode, dataset_name=prior_split)
+        df_eval = self.load_ratings(mode=mode, dataset_name=dataset_name, is_appended=False)
 
-            if mode == 'user':
-                df_rating_train = self.user2group(df_rating_train)
-                df_rating_eval = self.user2group(df_rating_eval)
+        if mode == "user":
+            df_train = self._map_user_ids_to_group_ids(df_train)
+            df_eval = self._map_user_ids_to_group_ids(df_eval)
 
-            negative_samples_dict = self.load_negative_samples(mode=mode, dataset_name=dataset_name)
-            df_eval = self._load_eval_data(df_rating_train, df_rating_eval, negative_samples_dict)
-            df_eval.to_pickle(exp_eval_path)
-            print('Save data:', exp_eval_path)
-        else:
-            df_eval = pd.read_pickle(exp_eval_path)
-            print('Load data:', exp_eval_path)
+        negatives = self._load_negative_samples(mode=mode, dataset_name=dataset_name)
+        df_result = self._construct_eval_dataframe(df_train, df_eval, negatives)
 
-        return df_eval
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        df_result.to_pickle(cache_path)
+        logger.info("Save data: %s", cache_path)
+        return df_result
+
+    # ================================================================== #
+    # Helpers                                                             #
+    # ================================================================== #
+    @staticmethod
+    def _check_mode_split(mode: str, dataset_name: str, *, splits: Tuple[str, ...]) -> None:
+        if mode not in VALID_MODES:
+            raise ValueError(f"mode must be one of {VALID_MODES}, got {mode!r}")
+        if dataset_name not in splits:
+            raise ValueError(f"dataset_name must be one of {splits}, got {dataset_name!r}")
+
+
+
+
+
 

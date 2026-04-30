@@ -1,109 +1,146 @@
+"""Recommendation environment driven by an NMF rating predictor.
+
+Provides :class:`RecommendationEnvironment` — a Gymnasium environment whose
+hidden reward function is a low-rank reconstruction of the training rating
+matrix produced by :class:`sklearn.decomposition.NMF`.
 """
-Recommender environment based on a NMF-predicted rating matrix.
-"""
-import os
-from typing import Tuple
+from __future__ import annotations
+
+import logging
+from pathlib import Path
+from typing import List, Tuple
 
 import gymnasium as gym
 import numpy as np
-from scipy.sparse.csr import csr_matrix
+from scipy.sparse import csr_matrix
 from sklearn.decomposition import NMF
 
-from config import Config
+from config import TrainingConfig
 
 
-class Env(gym.Env):
-    """
-    Environment for the recommender system
-    https://github.com/openai/gym/blob/master/gym/core.py
-    """
-    metadata = {'render.modes': ['human']}
+__all__ = ["RecommendationEnvironment"]
+
+logger = logging.getLogger(__name__)
+
+
+_VALID_SPLITS: Tuple[str, ...] = ("train", "val", "test")
+
+
+class RecommendationEnvironment(gym.Env):
+    """Group-recommendation environment with NMF-imputed rewards."""
+
+    metadata = {"render.modes": ["human"]}
     reward_range = (0, 1)
 
-    def __init__(self, config: Config, rating_matrix: csr_matrix, dataset_name: str):
-        """
-        Initialize Env
+    # ================================================================== #
+    def __init__(
+        self,
+        config: TrainingConfig,
+        rating_matrix: csr_matrix,
+        dataset_name: str,
+    ) -> None:
+        """Initialise the environment.
 
-        :param config: configurations
-        :param rating_matrix: rating matrix
-        :param dataset_name: dataset name in ['train', 'val', 'test']
+        Args:
+            config: Training configuration.
+            rating_matrix: Sparse (group, item) → rating matrix.
+            dataset_name: Source split — ``'train'``, ``'val'`` or ``'test'``.
         """
-        assert dataset_name in ['train', 'val', 'test']
+        if dataset_name not in _VALID_SPLITS:
+            raise ValueError(f"dataset_name must be one of {_VALID_SPLITS}, got {dataset_name!r}")
+
         self.config = config
         self.action_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(config.action_size,))
         self.observation_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(config.state_size,))
 
         self.rating_matrix = rating_matrix
-        rating_matrix_coo = rating_matrix.tocoo()
-        rating_matrix_rows = rating_matrix_coo.row
-        rating_matrix_columns = rating_matrix_coo.col
-        self.rating_matrix_index_set = set(zip(*(rating_matrix_rows, rating_matrix_columns)))
-        self.env_name = 'env_' + dataset_name + '_' + str(self.config.env_n_components) + '.npy'
-        self.env_path = os.path.join(config.saves_folder_path, self.env_name)
+        coo = rating_matrix.tocoo()
+        self.known_rating_indices = set(zip(coo.row.tolist(), coo.col.tolist()))
 
-        self.rating_matrix_pred = None
+        self._env_name = f"env_{dataset_name}_{config.env_n_components}.npy"
+        self.env_path = str(Path(config.checkpoint_dir) / self._env_name)
+
+        self.predicted_ratings: np.ndarray = np.empty(0)
         self.load_env()
 
-        self.state = None
+        self.state: List[int] = []
         self.reset()
 
+    # ================================================================== #
+    # NMF predictor                                                       #
+    # ================================================================== #
     def load_env(self) -> None:
-        """Load (or train) the NMF-based environment."""
-        if not os.path.exists(self.env_path):
-            env_model = NMF(n_components=self.config.env_n_components,
-                            init='random',
-                            tol=self.config.env_tol,
-                            max_iter=self.config.env_max_iter,
-                            alpha_W=self.config.env_alpha,
-                            alpha_H=self.config.env_alpha,
-                            l1_ratio=0.0,
-                            verbose=True,
-                            random_state=0)
-            print('-' * 50)
-            print('Train environment:')
-            W = env_model.fit_transform(X=self.rating_matrix)
-            H = env_model.components_
-            self.rating_matrix_pred = W @ H
-            print('-' * 50)
-            np.save(self.env_path, self.rating_matrix_pred)
-            print('Save environment:', self.env_path)
-        else:
-            self.rating_matrix_pred = np.load(self.env_path)
-            print('Load environment:', self.env_path)
+        """Load the cached NMF prediction matrix or fit it on first run."""
+        cache_path = Path(self.env_path)
+        if cache_path.exists():
+            self.predicted_ratings = np.load(cache_path)
+            logger.info("Load environment: %s", cache_path)
+            return
 
-    def reset(self) -> list:
-        """Reset the environment to a random group with sufficient history."""
+        logger.info("Train environment (NMF, k=%d)", self.config.env_n_components)
+        model = NMF(
+            n_components=self.config.env_n_components,
+            init="random",
+            tol=self.config.env_tol,
+            max_iter=self.config.env_max_iter,
+            alpha_W=self.config.env_alpha,
+            alpha_H=self.config.env_alpha,
+            l1_ratio=0.0,
+            verbose=True,
+            random_state=0,
+        )
+        w = model.fit_transform(X=self.rating_matrix)
+        self.predicted_ratings = w @ model.components_
+
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        np.save(cache_path, self.predicted_ratings)
+        logger.info("Save environment: %s", cache_path)
+
+    # ================================================================== #
+    # Gym API                                                             #
+    # ================================================================== #
+    def reset(self) -> List[int]:
+        """Sample a random group with at least ``history_length`` items."""
+        rng = np.random.default_rng()
+        history_length = self.config.history_length
+        total_groups = self.config.total_group_num
+
         while True:
-            group_id = np.random.choice(range(1, self.config.total_group_num + 1))
-            nonzero_row, nonzero_col = self.rating_matrix[group_id, :].nonzero()
-            if len(nonzero_col) >= self.config.history_length:
+            group_id = int(rng.integers(low=1, high=total_groups + 1))
+            _, nonzero_cols = self.rating_matrix[group_id, :].nonzero()
+            if len(nonzero_cols) >= history_length:
                 break
-        history = np.random.choice(nonzero_col, size=self.config.history_length, replace=False).tolist()
+
+        history = rng.choice(nonzero_cols, size=history_length, replace=False).tolist()
         self.state = [group_id] + history
         return self.state
 
-    def step(self, action: int) -> Tuple[list, int, bool, dict]:
-        """Take one action in the environment."""
+    # ------------------------------------------------------------------ #
+    def step(self, action: int) -> Tuple[List[int], int, bool, dict]:
+        """Apply ``action`` (an item id) and return ``(state, reward, done, info)``."""
         group_id = self.state[0]
         history = self.state[1:]
 
-        if (group_id, action) in self.rating_matrix_index_set:
-            reward = self.rating_matrix[group_id, action]
+        if (group_id, action) in self.known_rating_indices:
+            reward = int(self.rating_matrix[group_id, action])
         else:
-            reward_probability = self.rating_matrix_pred[group_id, action]
-            reward = np.random.choice(self.config.rewards, p=[1 - reward_probability, reward_probability])
+            p_like = float(self.predicted_ratings[group_id, action])
+            p_like = max(0.0, min(1.0, p_like))
+            reward = int(np.random.choice(self.config.rewards, p=[1 - p_like, p_like]))
 
         if reward > 0:
             history = history[1:] + [action]
 
-        new_state = [group_id] + history
-        self.state = new_state
-        done = False
-        info: dict = {}
+        self.state = [group_id] + history
+        return self.state, reward, False, {}
 
-        return new_state, reward, done, info
+    # ------------------------------------------------------------------ #
+    def render(self, mode: str = "human") -> None:  # pragma: no cover
+        """No-op renderer (the environment is not visual)."""
+        return None
 
-    def render(self, mode: str = 'human') -> None:
-        """Render the environment (no-op)."""
-        pass
+
+
+
+
 

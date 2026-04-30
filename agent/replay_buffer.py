@@ -1,68 +1,94 @@
+"""Prioritised Experience Replay (proportional variant).
+
+Implements :class:`PrioritizedExperienceReplay` (Schaul et al., ICLR 2016).
+Transitions with larger TD-error are sampled more often; importance-sampling
+(IS) weights — annealed via the ``β`` schedule — correct the resulting bias
+during the gradient update.
 """
-Prioritized Experience Replay buffer.
-"""
+from __future__ import annotations
+
+from typing import Any, List, Tuple
+
 import numpy as np
 import torch
 
 
-class PrioritizedReplayBuffer(object):
-    """
-    Prioritized Experience Replay Buffer (proportional variant).
+__all__ = ["PrioritizedExperienceReplay"]
 
-    Transitions with higher TD-error are sampled more often.
-    Importance-sampling (IS) weights correct the resulting bias.
 
-    References:
-        Schaul et al., "Prioritized Experience Replay", ICLR 2016.
-    """
+Experience = Tuple[Any, Any, Any, Any]
+SampleTuple = Tuple[List[Experience], np.ndarray, torch.Tensor]
 
-    def __init__(self, buffer_size: int, alpha: float = 0.6,
-                 beta_start: float = 0.4, beta_frames: int = 100_000):
+
+class PrioritizedExperienceReplay:
+    """Proportional Prioritised Experience Replay buffer."""
+
+    def __init__(
+        self,
+        buffer_size: int,
+        alpha: float = 0.6,
+        beta_start: float = 0.4,
+        beta_frames: int = 100_000,
+    ) -> None:
+        """Allocate the storage and priority arrays.
+
+        Args:
+            buffer_size: Maximum number of stored transitions.
+            alpha: Priority exponent — ``0`` is uniform, ``1`` is full PER.
+            beta_start: Initial IS-weight exponent (annealed to 1).
+            beta_frames: Number of :meth:`add` calls over which ``β``
+                reaches 1.0.
         """
-        Initialize PrioritizedReplayBuffer
+        self.buffer_size: int = int(buffer_size)
+        self.alpha: float = float(alpha)
+        self.beta: float = float(beta_start)
+        self._beta_increment: float = (1.0 - beta_start) / max(beta_frames, 1)
 
-        :param buffer_size: maximum number of stored transitions
-        :param alpha: priority exponent (0 = uniform, 1 = full prioritisation)
-        :param beta_start: initial IS-weight exponent (annealed to 1 over training)
-        :param beta_frames: number of push() calls over which beta reaches 1.0
-        """
-        self.buffer_size = buffer_size
-        self.alpha = alpha
-        self.beta = beta_start
-        self.beta_increment = (1.0 - beta_start) / beta_frames
+        self._storage: List[Experience] = []
+        self._priorities: np.ndarray = np.zeros(self.buffer_size, dtype=np.float32)
+        self._cursor: int = 0  # circular write pointer
 
-        self.buffer: list = []
-        self.priorities = np.zeros(buffer_size, dtype=np.float32)
-        self.pos = 0  # circular write pointer
-
+    # ------------------------------------------------------------------ #
     def __len__(self) -> int:
-        return len(self.buffer)
+        return len(self._storage)
 
-    def push(self, experience: tuple) -> None:
+    # ------------------------------------------------------------------ #
+    def add(self, experience: Experience) -> None:
+        """Insert a transition with the current maximum priority.
+
+        Args:
+            experience: A ``(state, action, reward, next_state)`` tuple.
         """
-        Push one experience into the buffer with maximum current priority.
-
-        :param experience: (state, action, reward, next_state)
-        """
-        max_priority = float(self.priorities[:len(self.buffer)].max()) if self.buffer else 1.0
-
-        if len(self.buffer) < self.buffer_size:
-            self.buffer.append(experience)
+        if self._storage:
+            max_priority = float(self._priorities[: len(self._storage)].max())
         else:
-            self.buffer[self.pos] = experience
+            max_priority = 1.0
 
-        self.priorities[self.pos] = max_priority
-        self.pos = (self.pos + 1) % self.buffer_size
+        if len(self._storage) < self.buffer_size:
+            self._storage.append(experience)
+        else:
+            self._storage[self._cursor] = experience
 
-    def sample(self, batch_size: int):
+        self._priorities[self._cursor] = max_priority
+        self._cursor = (self._cursor + 1) % self.buffer_size
+
+
+
+    # ------------------------------------------------------------------ #
+    def sample(self, batch_size: int) -> SampleTuple:
+        """Sample a batch proportionally to stored priorities.
+
+        Args:
+            batch_size: Number of transitions to draw.
+
+        Returns:
+            ``(batch, indices, importance_weights)`` where ``batch`` is a
+            list of experiences, ``indices`` is a numpy array used by
+            :meth:`update_priorities`, and ``importance_weights`` is a 1-D
+            tensor of normalised IS weights.
         """
-        Sample a batch proportional to stored priorities.
-
-        :param batch_size: number of transitions to sample
-        :return: (batch list, indices, IS-weight tensor)
-        """
-        n = len(self.buffer)
-        priorities = self.priorities[:n]
+        n = len(self._storage)
+        priorities = self._priorities[:n]
 
         probs = priorities ** self.alpha
         probs /= probs.sum()
@@ -72,20 +98,32 @@ class PrioritizedReplayBuffer(object):
         weights = (n * probs[indices]) ** (-self.beta)
         weights /= weights.max()
 
-        self.beta = min(1.0, self.beta + self.beta_increment)
+        # Anneal β
+        self.beta = min(1.0, self.beta + self._beta_increment)
 
-        batch = [self.buffer[i] for i in indices]
-        is_weights = torch.FloatTensor(weights)
+        batch = [self._storage[i] for i in indices]
+        is_weights = torch.from_numpy(weights.astype(np.float32))
         return batch, indices, is_weights
 
-    def update_priorities(self, indices: np.ndarray, td_errors: np.ndarray, epsilon: float = 1e-6) -> None:
-        """
-        Update priorities for a previously sampled batch.
+    # ------------------------------------------------------------------ #
+    def update_priorities(
+        self,
+        indices: np.ndarray,
+        td_errors: np.ndarray,
+        epsilon: float = 1e-6,
+    ) -> None:
+        """Refresh priorities for a previously sampled batch.
 
-        :param indices: indices returned by sample()
-        :param td_errors: absolute TD errors for the sampled transitions
-        :param epsilon: small constant added to prevent zero priorities
+        Args:
+            indices: Indices returned by :meth:`sample`.
+            td_errors: Absolute TD errors for those transitions.
+            epsilon: Small floor to avoid zero priorities.
         """
-        for idx, err in zip(indices, td_errors):
-            self.priorities[idx] = float(abs(err)) + epsilon
+        new_priorities = np.abs(td_errors).astype(np.float32) + float(epsilon)
+        self._priorities[indices] = new_priorities
+
+
+
+
+
 
