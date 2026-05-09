@@ -56,6 +56,7 @@ ipython_config.py
 # IDEs / editors
 # ──────────────────────────────────────────────────────────────────────────────
 .idea/
+.claude/
 .vscode/
 *.iml
 *.swp
