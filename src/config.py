@@ -29,9 +29,9 @@ logger = logging.getLogger(__name__)
 
 
 _PROJECT_ROOT = Path(__file__).resolve().parent
-_DEFAULT_DATASET_DIR = _PROJECT_ROOT / "data" / "MovieLens-Rand"
-_DEFAULT_CHECKPOINT_DIR = Path("data") / "saves"
-_DEFAULT_OUTPUT_DIR = Path("data") / "results"
+_DEFAULT_DATASET_DIR = _PROJECT_ROOT / "data" / "MovieLens-1m"
+_DEFAULT_CHECKPOINT_DIR = Path("generators/data") / "saves"
+_DEFAULT_OUTPUT_DIR = Path("generators/data") / "results"
 
 _TUPLE_FIELDS = frozenset({"actor_hidden_sizes", "critic_hidden_sizes"})
 

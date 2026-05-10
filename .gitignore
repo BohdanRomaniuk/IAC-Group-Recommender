@@ -91,7 +91,7 @@ data/ml-1m/
 data/ml-1m.zip
 data/ml-32m/
 data/MovieLens-32m/
-data/MovieLens-Rand/
+data/MovieLens-1m/
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Experiment trackers

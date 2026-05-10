@@ -3,7 +3,7 @@
 # Fields not listed here keep their defaults from config.py.
 
 # Data
-data_folder_path: ./data/MovieLens-Rand
+data_folder_path: ./data/MovieLens-1m
 saves_folder_path: data/saves
 results_folder_path: data/results
 

@@ -195,6 +195,15 @@ class GroupGenerator(object):
     def generate_group_ratings(self, users, rating_mat, timestamp_mat,
                                num_groups, group_sizes, min_num_ratings):
         np.random.seed(0)
+
+        # Sort users by most recent rating (descending) so groups are formed
+        # from recently active users rather than the oldest activity.
+        user_max_ts = Counter()
+        for (u, _i), ts in timestamp_mat.items():
+            if ts > user_max_ts[u]:
+                user_max_ts[u] = ts
+        users = sorted(users, key=lambda u: user_max_ts[u], reverse=True)
+
         groups = set()
         groups_ratings = []
         groups_rated_items_dict = {}
@@ -346,7 +355,7 @@ if __name__ == '__main__':
     data_folder_path = os.path.join('./', 'data')
     data_path = os.path.join(data_folder_path, 'ml-1m')
     data_zip_path = os.path.join(data_folder_path, 'ml-1m.zip')
-    output_path = os.path.join(data_folder_path, 'MovieLens-Rand')
+    output_path = os.path.join(data_folder_path, 'MovieLens-1m')
 
     if not os.path.exists(data_path):
         with zipfile.ZipFile(data_zip_path, 'r') as data_zip:

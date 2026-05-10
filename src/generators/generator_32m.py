@@ -291,6 +291,19 @@ class GroupGenerator(object):
     def generate_group_ratings(self, users, rating_mat, timestamp_mat,
                                num_groups, group_sizes, min_num_ratings):
         np.random.seed(0)
+
+        # Sort users by most recent rating (descending) so groups are formed
+        # from recently active users rather than the oldest activity.
+        if hasattr(timestamp_mat, '_data'):
+            user_max_ts = {u: (max(d.values()) if d else 0)
+                           for u, d in timestamp_mat._data.items()}
+        else:
+            user_max_ts = Counter()
+            for (u, _i), ts in timestamp_mat.items():
+                if ts > user_max_ts[u]:
+                    user_max_ts[u] = ts
+        users = sorted(users, key=lambda u: user_max_ts.get(u, 0), reverse=True)
+
         groups = set()
         groups_ratings = []
         groups_rated_items_dict = {}

@@ -165,7 +165,7 @@ IAC-Group-Recommender/
 └── data/
     ├── ml-1m/                  # Вихідний (raw) набір даних MovieLens-1M
     ├── ml-32m/                 # Вихідний набір даних MovieLens-32M
-    ├── MovieLens-Rand/         # Оброблені дані з випадковим розбиттям груп
+    ├── MovieLens-1m/           # Оброблені дані з випадковим розбиттям груп
     ├── MovieLens-32m/          # Оброблені дані MovieLens-32M
     ├── saves/                  # Контрольні точки моделей, кеш eval-таблиць, NMF-середовище
     └── results/                # Криві втрат, числові метрики
@@ -247,7 +247,7 @@ python -c "import torch; print('CUDA:', torch.cuda.is_available()); \
 Перед першим запуском необхідно згенерувати оброблені групові набори даних із вихідних (raw) файлів MovieLens:
 
 ```bash
-# MovieLens-1M  →  data/MovieLens-Rand/
+# MovieLens-1M  →  data/MovieLens-1m/
 python -m generators.generator
 
 # MovieLens-32M  →  data/MovieLens-32m/
