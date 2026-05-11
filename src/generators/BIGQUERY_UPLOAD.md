@@ -123,35 +123,26 @@ Set a variable pointing to the CSV folder so the commands below are shorter:
 CSV_DIR="$HOME/Projects/IAC-Group-Recommender/src/generators/data/MovieLens-32m/looker_csvs"
 ```
 
-Now load each table. The `--autodetect` flag tells BigQuery to infer column names and types from the CSV header automatically.
+Now load each table. `--autodetect` infers column names and types from the CSV header. `--replace` truncates the table first, so re-running this after a data update is safe.
 
 ```bash
-bq load --autodetect --source_format=CSV \
-    group_recommender.groups \
-    "$CSV_DIR/groups.csv"
+for table in groups group_members group_ratings user_ratings users movies; do
+    echo "Loading $table …"
+    bq load --replace --autodetect --source_format=CSV \
+        group_recommender.$table \
+        "$CSV_DIR/${table}.csv"
+done
+```
 
-bq load --autodetect --source_format=CSV \
-    group_recommender.group_members \
-    "$CSV_DIR/group_members.csv"
+Each table prints a job ID and then `SUCCESS` when done. The two large files (`group_ratings`, `user_ratings`) may take a minute or two.
 
-bq load --autodetect --source_format=CSV \
-    group_recommender.group_ratings \
-    "$CSV_DIR/group_ratings.csv"
+To reload a single table (e.g. after changing only `movies.csv`):
 
-bq load --autodetect --source_format=CSV \
-    group_recommender.user_ratings \
-    "$CSV_DIR/user_ratings.csv"
-
-bq load --autodetect --source_format=CSV \
-    group_recommender.users \
-    "$CSV_DIR/users.csv"
-
-bq load --autodetect --source_format=CSV \
+```bash
+bq load --replace --autodetect --source_format=CSV \
     group_recommender.movies \
     "$CSV_DIR/movies.csv"
 ```
-
-Each command prints a job ID and then `SUCCESS` when done. The two large files (`group_ratings`, `user_ratings`) may take a minute or two.
 
 ### Verify the upload
 

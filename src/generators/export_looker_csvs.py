@@ -13,7 +13,7 @@ group_members.csv  group_id, user_id
 group_ratings.csv  group_id, movie_id, rating, timestamp, split
 user_ratings.csv   user_id,  movie_id, rating, timestamp, split
 users.csv          user_id
-movies.csv         movie_id, title, year, genre  (one row per genre)
+movies.csv         movie_id, title, year, genres  (pipe-separated genres, one row per movie)
 """
 
 import argparse
@@ -23,6 +23,7 @@ import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+
 
 
 BASE_DIR = Path(__file__).parent  # src/generators/
@@ -53,39 +54,20 @@ def parse_group_members(path: Path):
 
 def parse_ratings(path: Path, split: str):
     """Yield (entity_id, movie_id, rating, timestamp_iso, split) rows.
-
-    Handles two formats:
-      Normal:   entity_id movie_id rating timestamp
-      Negative: (entity_id,pos_movie_id) neg_id1 neg_id2 ...
-                → one row per negative movie with rating=0, timestamp=None
+    Format: entity_id movie_id rating timestamp
     """
-    is_negative = "Negative" in path.name
     with open(path, encoding="utf-8", errors="replace") as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
-            if is_negative:
-                # Format: (group_id,positive_movie_id) neg1 neg2 ...
-                m = re.match(r"\((\d+),(\d+)\)\s+(.*)", line)
-                if not m:
-                    continue
-                entity_id = int(m.group(1))
-                pos_movie_id = int(m.group(2))
-                neg_ids = [int(x) for x in m.group(3).split()]
-                # Positive anchor
-                yield entity_id, pos_movie_id, 1, None, split
-                # Negative candidates
-                for neg_id in neg_ids:
-                    yield entity_id, neg_id, 0, None, split
-            else:
-                parts = line.split()
-                entity_id = int(parts[0])
-                movie_id  = int(parts[1])
-                rating    = int(parts[2])
-                ts        = int(parts[3])
-                ts_iso = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-                yield entity_id, movie_id, rating, ts_iso, split
+            parts = line.split()
+            entity_id = int(parts[0])
+            movie_id  = int(parts[1])
+            rating    = int(parts[2])
+            ts        = int(parts[3])
+            ts_iso = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            yield entity_id, movie_id, rating, ts_iso, split
 
 
 def parse_users(path: Path):
@@ -112,7 +94,7 @@ def _extract_year(title: str):
 
 
 def parse_movies(path: Path):
-    """Yield (movie_id, title, year, genre) rows — one row per genre."""
+    """Yield (movie_id, title, year, genres) rows — one row per movie."""
     with open(path, encoding="utf-8", errors="replace") as f:
         for line in f:
             line = line.strip()
@@ -129,10 +111,7 @@ def parse_movies(path: Path):
             title_raw = parts[1].strip()
             genres_str = parts[2].strip()
             title, year = _extract_year(title_raw)
-            for genre in genres_str.split("|"):
-                genre = genre.strip()
-                if genre:
-                    yield movie_id, title, year, genre
+            yield movie_id, title, year, genres_str
 
 
 # ---------------------------------------------------------------------------
@@ -164,11 +143,9 @@ def export(data_dir: Path, out_dir: Path):
     print("Parsing group rating files …")
     group_rating_rows = []
     for fname, split in [
-        ("groupRatingTrain.dat",        "train"),
-        ("groupRatingVal.dat",          "val"),
-        ("groupRatingTest.dat",         "test"),
-        ("groupRatingValNegative.dat",  "val_negative"),
-        ("groupRatingTestNegative.dat", "test_negative"),
+        ("groupRatingTrain.dat", "train"),
+        ("groupRatingVal.dat",   "val"),
+        ("groupRatingTest.dat",  "test"),
     ]:
         p = data_dir / fname
         if p.exists():
@@ -181,11 +158,9 @@ def export(data_dir: Path, out_dir: Path):
     print("Parsing user rating files …")
     user_rating_rows = []
     for fname, split in [
-        ("userRatingTrain.dat",        "train"),
-        ("userRatingVal.dat",          "val"),
-        ("userRatingTest.dat",         "test"),
-        ("userRatingValNegative.dat",  "val_negative"),
-        ("userRatingTestNegative.dat", "test_negative"),
+        ("userRatingTrain.dat", "train"),
+        ("userRatingVal.dat",   "val"),
+        ("userRatingTest.dat",  "test"),
     ]:
         p = data_dir / fname
         if p.exists():
@@ -203,7 +178,7 @@ def export(data_dir: Path, out_dir: Path):
     print("Parsing movies.dat …")
     movie_rows = list(parse_movies(data_dir / "movies.dat"))
     write_csv(out_dir / "movies.csv",
-              ["movie_id", "title", "year", "genre"],
+              ["movie_id", "title", "year", "genres"],
               movie_rows)
 
     # Summary
