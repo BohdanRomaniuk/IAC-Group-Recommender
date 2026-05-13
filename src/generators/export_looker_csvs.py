@@ -52,9 +52,12 @@ def parse_group_members(path: Path):
                 yield int(group_id), int(user_id.strip())
 
 
-def parse_ratings(path: Path, split: str):
+def parse_ratings(path: Path, split: str, rating_lookup: dict | None = None):
     """Yield (entity_id, movie_id, rating, timestamp_iso, split) rows.
     Format: entity_id movie_id rating timestamp
+
+    If rating_lookup is provided, the stored binary label is replaced with the
+    original rating from {(entity_id, movie_id): rating}.
     """
     with open(path, encoding="utf-8", errors="replace") as f:
         for line in f:
@@ -66,6 +69,8 @@ def parse_ratings(path: Path, split: str):
             movie_id  = int(parts[1])
             rating    = int(parts[2])
             ts        = int(parts[3])
+            if rating_lookup is not None:
+                rating = rating_lookup.get((entity_id, movie_id), rating)
             ts_iso = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
             yield entity_id, movie_id, rating, ts_iso, split
 
@@ -115,6 +120,60 @@ def parse_movies(path: Path):
 
 
 # ---------------------------------------------------------------------------
+# Original-rating lookup (restores 0–5 scale from raw source data)
+# ---------------------------------------------------------------------------
+
+def _collect_user_pairs(data_dir: Path) -> set:
+    """Collect all (user_id, movie_id) pairs present in the user rating dat files."""
+    pairs = set()
+    for fname in ("userRatingTrain.dat", "userRatingVal.dat", "userRatingTest.dat"):
+        p = data_dir / fname
+        if not p.exists():
+            continue
+        with open(p, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 2:
+                    pairs.add((int(parts[0]), int(parts[1])))
+    return pairs
+
+
+def _load_original_ratings_lookup(data_dir: Path, pairs: set) -> dict:
+    """Return {(user_id, movie_id): original_rating} for *pairs* only.
+
+    Scans the raw MovieLens source (ratings.csv or ratings.dat) found next to
+    the processed data directory, loading only the entries we actually need so
+    memory usage stays proportional to the export size, not the full dataset.
+    """
+    raw_dir = data_dir.parent / data_dir.name.replace("MovieLens-", "ml-")
+    lookup: dict = {}
+
+    csv_path = raw_dir / "ratings.csv"
+    if csv_path.exists():
+        with open(csv_path, encoding="utf-8") as f:
+            next(f)  # skip header
+            for line in f:
+                parts = line.split(",")
+                key = (int(parts[0]), int(parts[1]))
+                if key in pairs:
+                    lookup[key] = float(parts[2])
+        return lookup
+
+    dat_path = raw_dir / "ratings.dat"
+    if dat_path.exists():
+        with open(dat_path, encoding="utf-8") as f:
+            for line in f:
+                parts = line.strip().split("::")
+                if len(parts) >= 3:
+                    key = (int(parts[0]), int(parts[1]))
+                    if key in pairs:
+                        lookup[key] = float(parts[2])
+        return lookup
+
+    return lookup
+
+
+# ---------------------------------------------------------------------------
 # Writers
 # ---------------------------------------------------------------------------
 
@@ -144,7 +203,7 @@ def export(data_dir: Path, out_dir: Path):
     group_rating_rows = []
     for fname, split in [
         ("groupRatingTrain.dat", "train"),
-        ("groupRatingVal.dat",   "val"),
+        ("groupRatingVal.dat",   "test"),
         ("groupRatingTest.dat",  "test"),
     ]:
         p = data_dir / fname
@@ -156,15 +215,20 @@ def export(data_dir: Path, out_dir: Path):
 
     # --- user_ratings.csv ---
     print("Parsing user rating files …")
+    print("  Loading original rating lookup …")
+    user_pairs = _collect_user_pairs(data_dir)
+    rating_lookup = _load_original_ratings_lookup(data_dir, user_pairs)
+    if not rating_lookup:
+        print("  Warning: raw ratings source not found — binary labels will be used.")
     user_rating_rows = []
     for fname, split in [
         ("userRatingTrain.dat", "train"),
-        ("userRatingVal.dat",   "val"),
+        ("userRatingVal.dat",   "test"),
         ("userRatingTest.dat",  "test"),
     ]:
         p = data_dir / fname
         if p.exists():
-            user_rating_rows.extend(parse_ratings(p, split))
+            user_rating_rows.extend(parse_ratings(p, split, rating_lookup if rating_lookup else None))
     write_csv(out_dir / "user_ratings.csv",
               ["user_id", "movie_id", "rating", "timestamp", "split"],
               user_rating_rows)
